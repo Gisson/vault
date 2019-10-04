@@ -172,7 +172,27 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 	b.Backend.Paths = append(b.Backend.Paths, b.hostInfoPath())
 
 	if core.rawEnabled {
-		b.Backend.Paths = append(b.Backend.Paths, &framework.Path{
+		b.Backend.Paths = append(b.Backend.Paths, b.rawPaths()...)
+	}
+
+	if _, ok := core.underlyingPhysical.(*raft.RaftBackend); ok {
+		b.Backend.Paths = append(b.Backend.Paths, b.raftStoragePaths()...)
+	}
+
+	b.Backend.Invalidate = sysInvalidate(b)
+	return b
+}
+
+func (b *SystemBackend) rawPaths() []*framework.Path {
+	r := &RawBackend{
+		barrier: b.Core.barrier,
+		logger:  b.Core.logger,
+		checkRaw: func(path string) error {
+			return checkRaw(b, path)
+		},
+	}
+	return []*framework.Path{
+		&framework.Path{
 			Pattern: "(raw/?$|raw/(?P<path>.+))",
 
 			Fields: map[string]*framework.FieldSchema{
@@ -186,34 +206,27 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
-					Callback: b.handleRawRead,
+					Callback: r.handleRawRead,
 					Summary:  "Read the value of the key at the given path.",
 				},
 				logical.UpdateOperation: &framework.PathOperation{
-					Callback: b.handleRawWrite,
+					Callback: r.handleRawWrite,
 					Summary:  "Update the value of the key at the given path.",
 				},
 				logical.DeleteOperation: &framework.PathOperation{
-					Callback: b.handleRawDelete,
+					Callback: r.handleRawDelete,
 					Summary:  "Delete the key with given path.",
 				},
 				logical.ListOperation: &framework.PathOperation{
-					Callback: b.handleRawList,
+					Callback: r.handleRawList,
 					Summary:  "Return a list keys for a given path prefix.",
 				},
 			},
 
 			HelpSynopsis:    strings.TrimSpace(sysHelp["raw"][0]),
 			HelpDescription: strings.TrimSpace(sysHelp["raw"][1]),
-		})
+		},
 	}
-
-	if _, ok := core.underlyingPhysical.(*raft.RaftBackend); ok {
-		b.Backend.Paths = append(b.Backend.Paths, b.raftStoragePaths()...)
-	}
-
-	b.Backend.Invalidate = sysInvalidate(b)
-	return b
 }
 
 // SystemBackend implements logical.Backend and is used to interact with
@@ -2237,8 +2250,16 @@ func (b *SystemBackend) handleConfigUIHeadersDelete(ctx context.Context, req *lo
 	return nil, nil
 }
 
+type (
+	RawBackend struct {
+		barrier  SecurityBarrier
+		logger   log.Logger
+		checkRaw func(path string) error
+	}
+)
+
 // handleRawRead is used to read directly from the barrier
-func (b *SystemBackend) handleRawRead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+func (b *RawBackend) handleRawRead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	path := data.Get("path").(string)
 
 	// Prevent access of protected paths
@@ -2250,12 +2271,12 @@ func (b *SystemBackend) handleRawRead(ctx context.Context, req *logical.Request,
 	}
 
 	// Run additional checks if needed
-	if err := checkRaw(b, path); err != nil {
-		b.Core.logger.Warn(err.Error(), "path", path)
+	if err := b.checkRaw(path); err != nil {
+		b.logger.Warn(err.Error(), "path", path)
 		return logical.ErrorResponse("cannot read '%s'", path), logical.ErrInvalidRequest
 	}
 
-	entry, err := b.Core.barrier.Get(ctx, path)
+	entry, err := b.barrier.Get(ctx, path)
 	if err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
@@ -2286,7 +2307,7 @@ func (b *SystemBackend) handleRawRead(ctx context.Context, req *logical.Request,
 }
 
 // handleRawWrite is used to write directly to the barrier
-func (b *SystemBackend) handleRawWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+func (b *RawBackend) handleRawWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	path := data.Get("path").(string)
 
 	// Prevent access of protected paths
@@ -2302,14 +2323,14 @@ func (b *SystemBackend) handleRawWrite(ctx context.Context, req *logical.Request
 		Key:   path,
 		Value: []byte(value),
 	}
-	if err := b.Core.barrier.Put(ctx, entry); err != nil {
+	if err := b.barrier.Put(ctx, entry); err != nil {
 		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
 	}
 	return nil, nil
 }
 
 // handleRawDelete is used to delete directly from the barrier
-func (b *SystemBackend) handleRawDelete(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+func (b *RawBackend) handleRawDelete(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	path := data.Get("path").(string)
 
 	// Prevent access of protected paths
@@ -2320,14 +2341,14 @@ func (b *SystemBackend) handleRawDelete(ctx context.Context, req *logical.Reques
 		}
 	}
 
-	if err := b.Core.barrier.Delete(ctx, path); err != nil {
+	if err := b.barrier.Delete(ctx, path); err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
 	return nil, nil
 }
 
 // handleRawList is used to list directly from the barrier
-func (b *SystemBackend) handleRawList(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+func (b *RawBackend) handleRawList(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	path := data.Get("path").(string)
 	if path != "" && !strings.HasSuffix(path, "/") {
 		path = path + "/"
@@ -2342,12 +2363,12 @@ func (b *SystemBackend) handleRawList(ctx context.Context, req *logical.Request,
 	}
 
 	// Run additional checks if needed
-	if err := checkRaw(b, path); err != nil {
-		b.Core.logger.Warn(err.Error(), "path", path)
+	if err := b.checkRaw(path); err != nil {
+		b.logger.Warn(err.Error(), "path", path)
 		return logical.ErrorResponse("cannot list '%s'", path), logical.ErrInvalidRequest
 	}
 
-	keys, err := b.Core.barrier.List(ctx, path)
+	keys, err := b.barrier.List(ctx, path)
 	if err != nil {
 		return handleErrorNoReadOnlyForward(err)
 	}
